@@ -1,7 +1,6 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const crypto = require('crypto');
 const fetch = require('node-fetch');
 const admin = require('firebase-admin');
 
@@ -9,329 +8,307 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
 
-/* ================= CONFIG ================= */
 const PORT = process.env.PORT || 8080;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
-const PTX_API_KEY = process.env.PTX_API_KEY || '';
-const PTX_API_URL = process.env.PTX_API_URL || 'https://ptexchange-api.vercel.app/pay/jetton';
-const DEPOSIT_TON_ADDRESS = process.env.DEPOSIT_ADDRESS || 'UQA_NviYLQo64fs2dnE_-ic_JMil6xEKT4tixi0p6ajzGIMU';
-const ADMIN_KEY = process.env.ADMIN_KEY || 'change-me-admin-key';
-const RTDB_URL = process.env.RTDB_URL || 'https://notcoinbot-9f734-default-rtdb.firebaseio.com';
 
-/* Withdrawal rules (mirror the frontend) */
-const MIN_WITHDRAW = 50;
-const WD_FEE = 10;
-const FREE_MAX_WITHDRAW = 30;   // free users cap
-const MAX_WITHDRAWS_PER_DAY = 2;
-const REQ_FRIENDS = 5;
-const REQ_TASKS = 5;
+/* PT Exchange API */
+const PT_API_URL = 'https://ptexchange-api.vercel.app/pay/jetton';
+const PT_API_KEY = process.env.PT_API_KEY || 'ptx_78745a589719acd033b2b094accee468e072779a10b997be';
 
-/* ================= FIREBASE ADMIN ================= */
-function parseServiceAccount() {
+/* Firebase Admin */
+function parseSA() {
   const raw = process.env.FIREBASE_SERVICE_ACCOUNT || '';
   if (!raw) return null;
   try { return JSON.parse(raw); } catch (e) {
     try { return JSON.parse(raw.replace(/\\n/g, '\n')); } catch (e2) { return null; }
   }
 }
-
-let db = null;
-let rtdb = null;
+let db = null, rtdb = null;
 try {
-  const sa = parseServiceAccount();
+  const sa = parseSA();
   if (sa) {
-    admin.initializeApp({ credential: admin.credential.cert(sa), databaseURL: RTDB_URL });
+    admin.initializeApp({
+      credential: admin.credential.cert(sa),
+      databaseURL: process.env.RTDB_URL || "https://notcoinbot-9f734-default-rtdb.firebaseio.com"
+    });
     db = admin.firestore();
     rtdb = admin.database();
-    console.log('Firebase Admin ready');
+    console.log('✅ Firebase Admin ready');
   } else {
-    console.warn('FIREBASE_SERVICE_ACCOUNT missing!');
+    console.warn('⚠️ FIREBASE_SERVICE_ACCOUNT missing');
   }
-} catch (e) {  console.error('Firebase init error:', e.message);
+} catch (e) {
+  console.error('Firebase init error:', e.message);
 }
 
 function requireDb(req, res, next) {
-  if (!db) return res.status(500).json({ success: false, error: 'Firebase not configured on server' });
+  if (!db) return res.status(500).json({ success: false, error: 'Firebase not configured' });
   next();
 }
 
-/* ================= TELEGRAM INIT-DATA VALIDATION ================= */
-function verifyInitData(initData) {
-  if (!initData || !TELEGRAM_BOT_TOKEN) return null;
+app.get('/', (req, res) => res.json({ status: 'NotSplash Backend Online', time: new Date().toISOString() }));
+/* ============================================
+   CLAIM — atomic: earned → balance + GH
+   NO SIGNATURE CHECK — uses userId from body
+   ============================================ */
+app.post('/api/claim', requireDb, async (req, res) => {
   try {
-    const params = new URLSearchParams(initData);
-    const hash = params.get('hash');
-    if (!hash) return null;
-    params.delete('hash');
-
-    const pairs = [];
-    params.forEach(function (value, key) { pairs.push(key + '=' + value); });
-    pairs.sort();
-    const dataCheckString = pairs.join('\n');
-
-    const secretKey = crypto.createHmac('sha256', 'WebAppData').update(TELEGRAM_BOT_TOKEN).digest();
-    const calculated = crypto.createHmac('sha256', secretKey).update(dataCheckString).digest('hex');
-    if (calculated !== hash) return null;
-
-    const authDate = parseInt(params.get('auth_date') || '0', 10);
-    if (authDate && (Math.floor(Date.now() / 1000) - authDate) > 86400) return null; // 24h max
-
-    const userRaw = params.get('user');
-    if (!userRaw) return null;
-    return JSON.parse(userRaw);
-  } catch (e) {
-    return null;
-  }
-}
-
-function authTg(req, res, next) {
-  const user = verifyInitData(req.headers['x-telegram-init-data'] || '');
-  if (!user) return res.status(401).json({ success: false, error: 'Invalid Telegram signature' });
-  req.tgUser = user;
-  req.uid = 'tg_' + user.id;
-  next();
-}
-
-function authAdmin(req, res, next) {
-  const key = req.headers['x-admin-key'] || '';
-  if (!key || key !== ADMIN_KEY) return res.status(403).json({ success: false, error: 'Bad admin key' });
-  next();
-}
-/* simple per-user cooldown to block spam/double-spend */
-const wdLocks = new Map();
-
-/* ================= ROUTES ================= */
-
-app.get('/', function (req, res) {
-  res.json({ status: 'NotSplash Backend Online', time: new Date().toISOString() });
-});
-
-app.get('/api/deposit-info', function (req, res) {
-  res.json({ tonAddress: DEPOSIT_TON_ADDRESS, qrImage: '' });
-});
-
-/* ---- Deposit submission (user) ---- */
-app.post('/api/deposit', requireDb, authTg, async function (req, res) {
-  try {
-    const amount = Number(req.body.amount) || 0;
-    const wallet = String(req.body.wallet || '').trim();
-    const txHash = String(req.body.txHash || '').trim();
-    if (amount <= 0) return res.status(400).json({ success: false, error: 'Invalid amount' });
-    if (wallet.length < 10) return res.status(400).json({ success: false, error: 'Invalid sender wallet' });
-
-    await db.collection('deposits').add({
-      userId: req.uid, tgId: req.tgUser.id,
-      name: req.tgUser.first_name || '', username: req.tgUser.username || '',
-      amount: amount, senderWallet: wallet, txHash: txHash,
-      status: 'pending', createdAt: Date.now()
-    });
-    res.json({ success: true });
-  } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-/* ---- Verify channel membership (user) ---- */
-app.post('/api/verify-task', requireDb, authTg, async function (req, res) {
-  const channel = String(req.body.channel || '').trim();
-  if (!channel) return res.status(400).json({ success: false, error: 'No channel provided' });
-  if (!TELEGRAM_BOT_TOKEN) return res.status(500).json({ success: false, error: 'Bot token missing on server' });
-  try {
-    const url = 'https://api.telegram.org/bot' + TELEGRAM_BOT_TOKEN +
-      '/getChatMember?chat_id=' + encodeURIComponent(channel) + '&user_id=' + req.tgUser.id;
-    const r = await fetch(url);
-    const data = await r.json();
-    if (data.ok && ['member', 'administrator', 'creator'].indexOf(data.result.status) !== -1) {
-      return res.json({ success: true });
-    }
-    return res.json({ success: false, error: 'Not a member yet' });
-  } catch (e) {    return res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-/* ---- Secure claim (atomic transaction — no double claims) ---- */
-app.post('/api/claim', requireDb, authTg, async function (req, res) {
-  try {
+    const uid = String(req.body.userId || '');
+    if (!uid) return res.status(400).json({ success: false, error: 'No userId' });
+    
     let result = null;
-    await db.runTransaction(async function (tx) {
-      const ref = db.collection('users').doc(req.uid);
+    await db.runTransaction(async tx => {
+      const ref = db.collection('users').doc(uid);
       const doc = await tx.get(ref);
       if (!doc.exists) throw new Error('User not found');
       const u = doc.data();
-      const sess = u.session || {};
-      const earned = sess.earned || 0;
+      const earned = (u.session && u.session.earned) || 0;
       if (earned <= 0) throw new Error('Nothing to claim');
-      const ghBonus = Math.floor(earned * 2);
+      const gh = Math.floor(earned * 2);
       tx.update(ref, {
         notBalance: admin.firestore.FieldValue.increment(earned),
         totalMined: admin.firestore.FieldValue.increment(earned),
-        ghBalance: admin.firestore.FieldValue.increment(ghBonus),
+        ghBalance: admin.firestore.FieldValue.increment(gh),
         'session.earned': 0
       });
-      result = { earned: earned, ghBonus: ghBonus };
+      result = { earned, gh };
     });
-    res.json({ success: true, amount: result.earned, ghBonus: result.ghBonus });
+    console.log('✅ Claim:', uid, result.earned, 'NOT +', result.gh, 'GH');
+    res.json({ success: true, amount: result.earned, ghBonus: result.gh });
   } catch (e) {
+    console.error('Claim error:', e.message);
     res.status(400).json({ success: false, error: e.message });
   }
 });
 
-/* ---- Secure withdraw (rules + PT Exchange, key hidden) ---- */
-app.post('/api/withdraw', requireDb, authTg, async function (req, res) {
-  const uid = req.uid;
-  const amount = Number(req.body.amount);
-  const wallet = String(req.body.wallet || '').trim();
-
-  if (!amount || isNaN(amount)) return res.status(400).json({ success: false, error: 'Invalid amount' });
-  if (wallet.length < 40 || wallet.length > 64) return res.status(400).json({ success: false, error: 'Invalid TON wallet' });
-
-  const now = Date.now();
-  const last = wdLocks.get(uid) || 0;
-  if (now - last < 10000) return res.status(429).json({ success: false, error: 'Too fast — wait a moment' });
-  wdLocks.set(uid, now);
-
-  let wdRef = null;
+/* ============================================
+   VERIFY TASK — Telegram membership check
+   NO SIGNATURE CHECK
+   ============================================ */
+app.post('/api/verify-task', requireDb, async (req, res) => {
+  const channel = String(req.body.channel || '').trim();
+  const tgId = Number(req.body.tgId || 0);
+  if (!channel || !tgId) return res.status(400).json({ success: false, error: 'Missing data' });
+  if (!TELEGRAM_BOT_TOKEN) return res.status(500).json({ success: false, error: 'Bot token missing on server' });
   try {
-    const userRef = db.collection('users').doc(uid);
-    const snap = await userRef.get();
-    if (!snap.exists) return res.status(404).json({ success: false, error: 'User not found' });    const u = snap.data();
-
-    /* enforce ALL rules server-side */
-    if ((u.referrals || 0) < REQ_FRIENDS) return res.status(400).json({ success: false, error: 'Invite ' + REQ_FRIENDS + ' friends first' });
-    if ((u.tasksCompleted || 0) < REQ_TASKS) return res.status(400).json({ success: false, error: 'Complete ' + REQ_TASKS + ' tasks first' });
-
-    const today = new Date().toDateString();
-    const todayCount = (u.withdrawalsToday || []).filter(function (d) { return d === today; }).length;
-    if (todayCount >= MAX_WITHDRAWS_PER_DAY) return res.status(400).json({ success: false, error: 'Max 2 withdrawals per day' });
-
-    if (amount < MIN_WITHDRAW) return res.status(400).json({ success: false, error: 'Minimum ' + MIN_WITHDRAW + ' NOT' });
-    if ((u.vip || 0) === 0 && amount > FREE_MAX_WITHDRAW) return res.status(400).json({ success: false, error: 'Free users max ' + FREE_MAX_WITHDRAW + ' NOT — upgrade to VIP' });
-    if (amount + WD_FEE > (u.notBalance || 0)) return res.status(400).json({ success: false, error: 'Insufficient balance' });
-
-    /* create processing record (real-time history) */
-    wdRef = rtdb.ref('withdrawals/' + uid).push();
-    await wdRef.set({
-      userId: uid, tgId: u.tgId, amount: amount, wallet: wallet,
-      status: 'processing', vipLevel: u.vip || 0,
-      createdAt: admin.database.ServerValue.TIMESTAMP
-    });
-
-    /* call PT Exchange (key hidden on server) */
-    const ptxRes = await fetch(PTX_API_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        api_key: PTX_API_KEY,
-        to_address: wallet,
-        jetton_symbol: 'NOT',
-        amount: Math.floor(amount - WD_FEE),
-        comment: 'NS-' + u.tgId
-      })
-    });
-    let ptx = {};
-    try { ptx = await ptxRes.json(); } catch (e) { ptx = {}; }
-    if (!ptxRes.ok) throw new Error((ptx && ptx.error) || 'PT Exchange failed');
-
-    /* deduct + record day */
-    const keep = (u.withdrawalsToday || []).filter(function (d) { return d !== today; });
-    keep.push(today);
-    await userRef.update({
-      notBalance: admin.firestore.FieldValue.increment(-amount),
-      wallet: wallet,
-      withdrawalsToday: keep.slice(-7)
-    });
-    await wdRef.update({ status: 'completed', txHash: ptx.txHash || '' });
-
-    res.json({ success: true, txHash: ptx.txHash || '' });
-  } catch (e) {    console.error('Withdraw error:', e.message);
-    if (wdRef) { wdRef.update({ status: 'failed', error: String(e.message) }).catch(function () {}); }
+    const url = 'https://api.telegram.org/bot' + TELEGRAM_BOT_TOKEN + '/getChatMember?chat_id=' + encodeURIComponent(channel) + '&user_id=' + tgId;
+    const r = await fetch(url);
+    const d = await r.json();
+    if (d.ok && ['member', 'administrator', 'creator'].indexOf(d.result.status) !== -1) {
+      console.log('✅ Task verified:', tgId, channel);
+      return res.json({ success: true });    }
+    return res.json({ success: false, error: 'Not a member' });
+  } catch (e) {
+    console.error('Verify error:', e.message);
     res.status(500).json({ success: false, error: e.message });
   }
 });
 
-/* ================= ADMIN ENDPOINTS ================= */
-
-app.get('/api/admin/deposits', requireDb, authAdmin, async function (req, res) {
-  const status = req.query.status || 'pending';
-  const snap = await db.collection('deposits').where('status', '==', status).orderBy('createdAt', 'desc').limit(100).get();
-  const items = [];
-  snap.forEach(function (d) { items.push(Object.assign({ id: d.id }, d.data())); });
-  res.json({ success: true, items: items });
-});
-
-app.post('/api/admin/deposit/approve', requireDb, authAdmin, async function (req, res) {
+/* ============================================
+   DEPOSIT — save record for admin review
+   NO SIGNATURE CHECK
+   ============================================ */
+app.post('/api/deposit', requireDb, async (req, res) => {
   try {
-    await db.runTransaction(async function (tx) {
-      const ref = db.collection('deposits').doc(String(req.body.depositId));
-      const doc = await tx.get(ref);
-      if (!doc.exists) throw new Error('Deposit not found');
-      const dep = doc.data();
-      if (dep.status !== 'pending') throw new Error('Already processed');
-      tx.update(db.collection('users').doc(dep.userId), {
-        tonBalance: admin.firestore.FieldValue.increment(dep.amount)
-      });
-      tx.update(ref, { status: 'approved', approvedAt: Date.now() });
+    const uid = String(req.body.userId || '');
+    const amount = Number(req.body.amount);
+    const wallet = String(req.body.wallet || '').trim();
+    const txHash = String(req.body.txHash || '').trim();
+    if (!uid || !amount || !wallet) return res.status(400).json({ success: false, error: 'Missing data' });
+
+    const userDoc = await db.collection('users').doc(uid).get();
+    if (!userDoc.exists) return res.status(404).json({ success: false, error: 'User not found' });
+    const u = userDoc.data();
+
+    await db.collection('deposits').add({
+      userId: uid, tgId: u.tgId, name: u.firstName || u.username || '',
+      amount: amount, senderWallet: wallet, txHash: txHash,
+      status: 'pending', createdAt: admin.firestore.FieldValue.serverTimestamp()
     });
+    console.log('✅ Deposit saved:', uid, amount, 'TON');
     res.json({ success: true });
-  } catch (e) { res.status(400).json({ success: false, error: e.message }); }
+  } catch (e) {
+    console.error('Deposit error:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
 });
 
-app.post('/api/admin/deposit/reject', requireDb, authAdmin, async function (req, res) {
+/* ============================================
+   WITHDRAW — validate + auto-pay via PT Exchange
+   NO SIGNATURE CHECK — uses userId from body
+   ============================================ */
+app.post('/api/withdraw', requireDb, async (req, res) => {
+  let uid = null, amt = 0, addr = '', wdRef = null;
   try {
-    await db.collection('deposits').doc(String(req.body.depositId)).update({ status: 'rejected', rejectedAt: Date.now() });
-    res.json({ success: true });
-  } catch (e) { res.status(400).json({ success: false, error: e.message }); }
-});
-
-app.get('/api/admin/submissions', requireDb, authAdmin, async function (req, res) {
-  const status = req.query.status || 'pending';
-  const snap = await db.collection('task_submissions').where('status', '==', status).orderBy('createdAt', 'desc').limit(100).get();
-  const items = [];
-  snap.forEach(function (d) { items.push(Object.assign({ id: d.id }, d.data())); });
-  res.json({ success: true, items: items });
-});
-
-app.post('/api/admin/submission/approve', requireDb, authAdmin, async function (req, res) {
-  try {    await db.runTransaction(async function (tx) {
-      const ref = db.collection('task_submissions').doc(String(req.body.submissionId));
-      const doc = await tx.get(ref);
-      if (!doc.exists) throw new Error('Submission not found');
-      const sub = doc.data();
-      if (sub.status !== 'pending') throw new Error('Already processed');
-
-      const userRef = db.collection('users').doc(sub.userId);
-      const taskField = 'tasks.' + sub.taskId;
-      const updates = {};
-      updates[taskField] = 'approved';
-      updates.tasksCompleted = admin.firestore.FieldValue.increment(1);
-      updates.notBalance = admin.firestore.FieldValue.increment(sub.reward || 1);
-      updates.ghBalance = admin.firestore.FieldValue.increment(sub.ghReward || 5);
-      tx.update(userRef, updates);
-      tx.update(ref, { status: 'approved', approvedAt: Date.now() });
-    });
-    res.json({ success: true });
-  } catch (e) { res.status(400).json({ success: false, error: e.message }); }
-});
-
-app.post('/api/admin/submission/reject', requireDb, authAdmin, async function (req, res) {
-  try {
-    const ref = db.collection('task_submissions').doc(String(req.body.submissionId));
-    const doc = await ref.get();
-    if (doc.exists) {
-      const sub = doc.data();
-      await ref.update({ status: 'rejected', rejectedAt: Date.now() });
-      const upd = {};
-      upd['tasks.' + sub.taskId] = 'rejected';
-      await db.collection('users').doc(sub.userId).update(upd);
+    uid = String(req.body.userId || '');
+    addr = String(req.body.wallet || '').trim();
+    amt = Number(req.body.amount);
+    if (!uid || !addr || addr.length < 10 || !amt) {
+      return res.status(400).json({ success: false, error: 'Invalid request' });
     }
-    res.json({ success: true });
-  } catch (e) { res.status(400).json({ success: false, error: e.message }); }
+    const doc = await db.collection('users').doc(uid).get();
+    if (!doc.exists) return res.status(404).json({ success: false, error: 'User not found' });
+    const u = doc.data();
+
+    /* Load settings */
+    const sdoc = await db.collection('config').doc('settings').get();
+    const s = sdoc.exists ? sdoc.data() : {};
+    const reqF = s.reqFriends || 5, reqT = s.reqTasks || 5;
+    const maxD = s.maxWithdrawsPerDay || 2, minW = s.minWithdraw || 30, fee = s.wdFee || 10;
+
+    /* Validation */
+    if (s.withdrawalsOpen === false) return res.status(400).json({ success: false, error: 'Withdrawals closed by admin' });
+    if ((u.referrals || 0) < reqF) return res.status(400).json({ success: false, error: 'Invite ' + reqF + ' friends first' });
+    if ((u.tasksCompleted || 0) < reqT) return res.status(400).json({ success: false, error: 'Complete ' + reqT + ' tasks first' });
+
+    const today = new Date().toDateString();
+    const wds = (u.withdrawalsToday || []).slice();
+    const tc = wds.filter(d => d === today).length;
+    if (tc >= maxD) return res.status(400).json({ success: false, error: 'Max ' + maxD + ' withdrawals/day' });
+
+    /* Free users: exactly 30 NOT | VIP: 30-50 NOT */
+    const isFree = (u.vip || 0) === 0;
+    const maxW = isFree ? 30 : 50;
+    if (isFree) {
+      if (amt !== 30) return res.status(400).json({ success: false, error: 'Free users must withdraw exactly 30 NOT' });
+    } else {
+      if (amt < minW) return res.status(400).json({ success: false, error: 'VIP minimum ' + minW + ' NOT' });
+      if (amt > maxW) return res.status(400).json({ success: false, error: 'VIP max ' + maxW + ' NOT per withdrawal' });
+    }
+    if (amt + fee > (u.notBalance || 0)) return res.status(400).json({ success: false, error: 'Insufficient balance' });
+
+    /* Create pending withdrawal record */
+    wdRef = rtdb.ref('withdrawals/' + uid).push();
+    await wdRef.set({
+      userId: uid, tgId: u.tgId, userName: u.firstName || u.username || '',
+      amount: amt, wallet: addr, status: 'pending', vipLevel: u.vip || 0,
+      createdAt: admin.database.ServerValue.TIMESTAMP
+    });
+
+    /* Deduct balance */
+    wds.push(today);
+    await db.collection('users').doc(uid).update({
+      notBalance: admin.firestore.FieldValue.increment(-amt),
+      wallet: addr,
+      withdrawalsToday: wds.slice(-7)
+    });
+    console.log('💸 Withdraw deduct:', uid, amt, 'NOT');
+
+    /* AUTO-PAY via PT Exchange */    console.log('💸 Calling PT Exchange:', amt, 'NOT to', addr);
+    const payRes = await fetch(PT_API_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        api_key: PT_API_KEY,
+        to_address: addr,
+        jetton_symbol: 'NOT',
+        amount: amt,
+        comment: 'NotSplash Withdrawal #' + wdRef.key.slice(-6)
+      })
+    });
+
+    const payText = await payRes.text();
+    console.log('PT Exchange response:', payRes.status, payText);
+
+    let payData = {};
+    try { payData = JSON.parse(payText); } catch(e) { payData = { raw: payText }; }
+
+    /* Check success — PT Exchange returns various formats */
+    const paySuccess = payRes.ok && payData.success !== false && !payData.error;
+    const txHash = payData.tx_hash || payData.txHash || payData.transaction_hash || payData.id || wdRef.key;
+    const payError = payData.error || payData.message || (paySuccess ? null : 'PT Exchange returned status ' + payRes.status);
+
+    if (paySuccess) {
+      /* SUCCESS — mark completed */
+      await wdRef.update({
+        status: 'completed',
+        txHash: txHash,
+        updatedAt: admin.database.ServerValue.TIMESTAMP
+      });
+      console.log('✅ Withdraw paid:', amt, 'NOT to', addr, 'tx:', txHash);
+      return res.json({
+        success: true,
+        id: wdRef.key,
+        txHash: txHash,
+        amount: amt,
+        net: amt - fee,
+        status: 'completed'
+      });
+    } else {
+      /* FAILED — REFUND user */
+      console.error('❌ PT Exchange failed:', payError);
+      await db.collection('users').doc(uid).update({
+        notBalance: admin.firestore.FieldValue.increment(amt)
+      });
+      await wdRef.update({
+        status: 'failed',
+        paymentError: payError,
+        updatedAt: admin.database.ServerValue.TIMESTAMP      });
+      return res.status(400).json({
+        success: false,
+        error: 'Payment failed: ' + payError + ' — balance refunded',
+        wdId: wdRef.key
+      });
+    }
+
+  } catch (e) {
+    console.error('Withdraw error:', e);
+    /* Refund if we deducted but something crashed */
+    if (uid && amt > 0 && wdRef) {
+      try {
+        await db.collection('users').doc(uid).update({
+          notBalance: admin.firestore.FieldValue.increment(amt)
+        });
+        await wdRef.update({ status: 'failed', paymentError: e.message });
+        console.log('↩️ Refunded after error:', uid, amt);
+      } catch (refundErr) {
+        console.error('Refund error:', refundErr);
+      }
+    }
+    res.status(500).json({ success: false, error: e.message });
+  }
 });
 
-/* 404 + error handler */
-app.use(function (req, res) { res.status(404).json({ success: false, error: 'Not found' }); });
-app.use(function (err, req, res, next) { console.error(err); res.status(500).json({ success: false, error: 'Server error' }); });
+/* ============================================
+   ADMIN: Manual approve withdrawal (retry PT Exchange)
+   ============================================ */
+app.post('/api/admin/approve-withdrawal', requireDb, async (req, res) => {
+  try {
+    const uid = String(req.body.userId || '');
+    const wdId = String(req.body.wdId || '');
+    if (!uid || !wdId) return res.status(400).json({ success: false, error: 'Missing userId/wdId' });
 
-app.listen(PORT, function () {
-  console.log('NotSplash backend running on port ' + PORT);
+    const wdSnap = await rtdb.ref('withdrawals/' + uid + '/' + wdId).once('value');
+    const wd = wdSnap.val();
+    if (!wd || wd.status !== 'pending') return res.status(400).json({ success: false, error: 'Not pending' });
+
+    const payRes = await fetch(PT_API_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        api_key: PT_API_KEY,
+        to_address: wd.wallet,
+        jetton_symbol: 'NOT',
+        amount: wd.amount,
+        comment: 'NotSplash Admin Approval #' + wdId.slice(-6)
+      })
+    });    let payData = {};
+    try { payData = await payRes.json(); } catch(e) {}
+
+    const paySuccess = payRes.ok && payData.success !== false && !payData.error;
+    if (paySuccess) {
+      const txHash = payData.tx_hash || payData.txHash || payData.id || wdId;
+      await rtdb.ref('withdrawals/' + uid + '/' + wdId).update({
+        status: 'completed', txHash: txHash,
+        updatedAt: admin.database.ServerValue.TIMESTAMP
+      });
+      res.json({ success: true, txHash: txHash });
+    } else {
+      throw new Error(payData.error || payData.message || 'PT Exchange failed');
+    }
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
 });
+
+app.listen(PORT, () => console.log('🚀 NotSplash Backend on port ' + PORT));
