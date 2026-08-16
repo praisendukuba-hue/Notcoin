@@ -133,68 +133,70 @@ app.post('/api/deposit', requireDb, async (req, res) => {
   }
 });
 
-/* ============================================
-   WITHDRAW — validate + auto-pay via PT Exchange
-   NO SIGNATURE CHECK — uses userId from body
-   ============================================ */
+//* ============ FIXED /api/withdraw — replace the old route ============ */
 app.post('/api/withdraw', requireDb, async (req, res) => {
-  let uid = null, amt = 0, addr = '', wdRef = null;
+  let uid = null, amt = 0, deducted = false, wdRef = null;
   try {
-    uid = String(req.body.userId || '');
-    addr = String(req.body.wallet || '').trim();
-    amt = Number(req.body.amount);
-    if (!uid || !addr || addr.length < 10 || !amt) {
-      return res.status(400).json({ success: false, error: 'Invalid request' });
-    }
+    uid  = String(req.body.userId || '');
+    const addr = String(req.body.wallet || '').trim();
+    amt  = Number(req.body.amount);
+    if (!uid || !addr || addr.length < 10 || !amt)
+      return res.status(400).json({ success:false, error:'Invalid request' });
+
     const doc = await db.collection('users').doc(uid).get();
-    if (!doc.exists) return res.status(404).json({ success: false, error: 'User not found' });
+    if (!doc.exists) return res.status(404).json({ success:false, error:'User not found' });
     const u = doc.data();
 
-    /* Load settings */
+    /* SAFE ids — never undefined */
+    const tgId   = u.telegramId || u.tgId || null;
+    const name   = u.firstName || u.username || '';
+
+    /* settings */
     const sdoc = await db.collection('config').doc('settings').get();
     const s = sdoc.exists ? sdoc.data() : {};
     const reqF = s.reqFriends || 5, reqT = s.reqTasks || 5;
     const maxD = s.maxWithdrawsPerDay || 2, minW = s.minWithdraw || 30, fee = s.wdFee || 10;
 
-    /* Validation */
-    if (s.withdrawalsOpen === false) return res.status(400).json({ success: false, error: 'Withdrawals closed by admin' });
-    if ((u.referrals || 0) < reqF) return res.status(400).json({ success: false, error: 'Invite ' + reqF + ' friends first' });
-    if ((u.tasksCompleted || 0) < reqT) return res.status(400).json({ success: false, error: 'Complete ' + reqT + ' tasks first' });
+    if (s.withdrawalsOpen === false) return res.status(400).json({ success:false, error:'Withdrawals closed' });
+    const refCount = (u.referrals && Array.isArray(u.referrals)) ? u.referrals.length : 0;
+    if (refCount < reqF) return res.status(400).json({ success:false, error:'Invite '+reqF+' friends first' });
+    if ((u.tasksCompleted||0) < reqT) return res.status(400).json({ success:false, error:'Complete '+reqT+' tasks first' });
 
     const today = new Date().toDateString();
-    const wds = (u.withdrawalsToday || []).slice();
-    const tc = wds.filter(d => d === today).length;
-    if (tc >= maxD) return res.status(400).json({ success: false, error: 'Max ' + maxD + ' withdrawals/day' });
+    const todayCount = (u.withdrawalsToday||[]).filter(d=>d===today).length;
+    if (todayCount >= maxD) return res.status(400).json({ success:false, error:'Max '+maxD+' withdrawals/day' });
 
-    /* Free users: exactly 30 NOT | VIP: 30-50 NOT */
-    const isFree = (u.vip || 0) === 0;
-    const maxW = isFree ? 30 : 50;
-    if (isFree) {
-      if (amt !== 30) return res.status(400).json({ success: false, error: 'Free users must withdraw exactly 30 NOT' });
-    } else {
-      if (amt < minW) return res.status(400).json({ success: false, error: 'VIP minimum ' + minW + ' NOT' });
-      if (amt > maxW) return res.status(400).json({ success: false, error: 'VIP max ' + maxW + ' NOT per withdrawal' });
-    }
-    if (amt + fee > (u.notBalance || 0)) return res.status(400).json({ success: false, error: 'Insufficient balance' });
+    const isFree = (u.vip||0) === 0;
+    if (isFree) { if (amt !== 30) return res.status(400).json({ success:false, error:'Free users withdraw exactly 30 NOT' }); }
+    else { if (amt < minW) return res.status(400).json({ success:false, error:'VIP minimum '+minW+' NOT' });
+           if (amt > 50)  return res.status(400).json({ success:false, error:'VIP max 50 NOT' }); }
+    if (amt + fee > (u.notBalance||0)) return res.status(400).json({ success:false, error:'Insufficient balance' });
 
-    /* Create pending withdrawal record */
-    wdRef = rtdb.ref('withdrawals/' + uid).push();
-    await wdRef.set({
-      userId: uid, tgId: u.tgId, userName: u.firstName || u.username || '',
-      amount: amt, wallet: addr, status: 'pending', vipLevel: u.vip || 0,
-      createdAt: admin.database.ServerValue.TIMESTAMP
-    });
-
-    /* Deduct balance */
-    wds.push(today);
+    /* STEP 1 — deduct FIRST (so a later failure can refund correctly) */
+    const wds = (u.withdrawalsToday||[]).filter(d=>d!==today); wds.push(today);
     await db.collection('users').doc(uid).update({
       notBalance: admin.firestore.FieldValue.increment(-amt),
       wallet: addr,
       withdrawalsToday: wds.slice(-7)
     });
-    console.log('💸 Withdraw deduct:', uid, amt, 'NOT');
+    deducted = true;
 
-    /* AUTO-PAY via PT Exchange */    console.log('💸 Calling PT Exchange:', amt, 'NOT to', addr);
+    /* STEP 2 — create history record (NO undefined values) */
+    wdRef = rtdb.ref('withdrawals/' + uid).push();
+    await wdRef.set({
+      userId: uid,
+      tgId: tgId,
+      userName: name,
+      amount: amt,
+      fee: fee,
+      netAmount: amt - fee,
+      wallet: addr,
+      status: 'pending',
+      vipLevel: u.vip || 0,
+      createdAt: admin.database.ServerValue.TIMESTAMP
+    });
+
+    /* STEP 3 — pay via PT Exchange (your exact format) */
     const payRes = await fetch(PT_API_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -202,11 +204,10 @@ app.post('/api/withdraw', requireDb, async (req, res) => {
         api_key: PT_API_KEY,
         to_address: addr,
         jetton_symbol: 'NOT',
-        amount: amt,
-        comment: 'NotSplash Withdrawal #' + wdRef.key.slice(-6)
+        amount: Math.floor(amt - fee),
+        comment: 'NotSplash-' + (tgId || uid)
       })
     });
-
     const payText = await payRes.text();
     console.log('PT Exchange response:', payRes.status, payText);
 
